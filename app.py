@@ -533,8 +533,32 @@ def render_sidebar():
 
     st.sidebar.header("Mission Analysis")
     mission_hours = st.sidebar.number_input(
-        "Mission duration (hours)", min_value=1.0, max_value=720.0, value=96.0, step=1.0,
+        "Mission duration (hours)",
+        min_value=1.0, max_value=8760.0, value=96.0, step=1.0,
+        help=(
+            "How long the backup fleet must carry the load on a single demand. "
+            "Reference values: 96 h = ~4-day worst-case outage; 168 h = 1 week; "
+            "720 h = 1 month; 8760 h = 1 year. "
+            "Note: for missions >~250-500 h the constant-MTBF mission model "
+            "is conservative -- it assumes lambda = 1/MTBF applies for the "
+            "full duration without any PM, oil changes, or refueling. Real "
+            "generators receive maintenance during long runs that this model "
+            "does not credit. For full-year planning horizons, also check the "
+            "steady-state fleet availability (Results tab, which is "
+            "independent of mission duration)."
+        ),
     )
+    # Friendly day/week display for any value above 24 h
+    if mission_hours >= 24:
+        if mission_hours < 24 * 14:
+            _dur_caption = f"= {mission_hours / 24:.1f} days"
+        elif mission_hours < 24 * 90:
+            _dur_caption = f"= {mission_hours / (24 * 7):.1f} weeks"
+        elif mission_hours < 24 * 365:
+            _dur_caption = f"= {mission_hours / (24 * 30.44):.1f} months"
+        else:
+            _dur_caption = f"= {mission_hours / 8760:.2f} years"
+        st.sidebar.caption(_dur_caption)
 
     config = TopologyConfig(
         gen_groups=get_fleet(),
