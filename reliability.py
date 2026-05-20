@@ -5,7 +5,16 @@ All functions are pure — no UI, no I/O.
 References:
   - IEEE 493: series/parallel RBD methods for power systems
   - Beta-factor CCF model (IEC 61508 / IEC TR 62380)
-  - NREL 2020 EDG study: generator mission modeling
+  - NREL 2020 EDG study (NREL/TP-5D00-76553): generator mission modeling
+  - NRC/INL 2022 EDG Performance: FTS, FTLR, FTR>1h rates
+
+Mission model (revised per NRC/INL 2022):
+  P_mission = (1 - FTS) * (1 - FTLR) * exp(-lambda_run * t)
+  where:
+    FTS  = fail-to-start probability per demand
+    FTLR = fail-to-load / early carry-load failure probability per demand
+    lambda_run = run-failure rate after first hour (failures per hour)
+    t    = mission duration (hours)
 """
 
 import math
@@ -36,7 +45,7 @@ def failure_rate_per_million_hours(mtbf_h: float) -> float:
 # ---------------------------------------------------------------------------
 
 def series_availability(availabilities: List[float]) -> float:
-    """All-series system: all components must work. A_s = ∏ A_i."""
+    """All-series system: all components must work. A_s = prod(A_i)."""
     result = 1.0
     for a in availabilities:
         result *= a
@@ -59,9 +68,9 @@ def kofn_availability(n: int, k: int, a: float) -> float:
         A_sys = sum_{i=k}^{n} C(n,i) * a^i * (1-a)^(n-i)
 
     Special cases:
-      k <= 0  → always available (1.0)
-      k >  n  → never available (0.0)
-      n == 1  → equals a
+      k <= 0  -> always available (1.0)
+      k >  n  -> never available (0.0)
+      n == 1  -> equals a
     """
     if k <= 0:
         return 1.0
@@ -84,7 +93,7 @@ def ccf_unavailability(unavail_a: float, unavail_b: float, beta: float) -> float
     """
     Two-path system unavailability with common-cause failures (beta-factor model).
 
-    U_sys = (1 - β) · U_A · U_B   +   β · max(U_A, U_B)
+    U_sys = (1 - beta) * U_A * U_B  +  beta * max(U_A, U_B)
 
     The first term is independent coincident failure; the second is CCF
     affecting both paths simultaneously.
@@ -94,33 +103,107 @@ def ccf_unavailability(unavail_a: float, unavail_b: float, beta: float) -> float
     return independent + common
 
 
+def kofn_with_ccf(n: int, k: int, u_path: float, beta: float) -> float:
+    """
+    k-of-n parallel system unavailability with beta-factor CCF.
+
+    Generalizes ``ccf_unavailability`` (which is the 2-path, k=1 case) to
+    arbitrary N paths with k-of-n redundancy.  Matches the same beta-factor
+    convention:
+
+      U_sys = beta * U_path  +  (1 - beta) * P(< k of n paths up | independent)
+
+    Math
+    ----
+    Path unavailability splits into two mutually exclusive modes:
+      - CCF mode (probability mass beta * U_path):
+            a single common-cause event kills all n paths simultaneously.
+      - Independent mode (residual probability mass 1 - beta * ...):
+            each path fails independently with unavailability U_path; the
+            system fails iff fewer than k paths survive (binomial sum).
+
+    The 2-path k=1 case reduces exactly to::
+        U_sys = (1 - beta) * U^2 + beta * U
+    matching the existing ``ccf_unavailability(u, u, beta)`` formula.
+
+    Topology mapping
+    ----------------
+      - 2N    (k=1, n=2): tolerate 1 failure of 2 paths
+      - 3N/2  (k=2, n=3): tolerate 1 failure of 3 paths
+      - 4N/3  (k=3, n=4): tolerate 1 failure of 4 paths
+      - 3+1   (k=3, n=4): same math as 4N/3 (operational philosophy differs)
+
+    Parameters
+    ----------
+    n        : number of redundant paths (>= 1)
+    k        : minimum paths required for system to be UP (1 <= k <= n)
+    u_path   : per-path unavailability (identical for all n paths)
+    beta     : common-cause factor (0 to 1; typical 0.01 - 0.10)
+
+    Returns
+    -------
+    System unavailability.
+    """
+    if n <= 0 or k <= 0:
+        return 0.0
+    if k > n:
+        return 1.0
+    if n == 1:
+        return u_path
+    a_path = 1.0 - u_path
+    # P(< k of n paths up) under independent failures
+    p_indep_fail = 1.0 - kofn_availability(n, k, a_path)
+    # CCF mode contributes beta * u_path; independent mode contributes (1-beta) * p_indep_fail
+    return beta * u_path + (1.0 - beta) * p_indep_fail
+
+
 # ---------------------------------------------------------------------------
-# Generator / prime-mover mission model
+# Generator / prime-mover mission model (revised: includes FTLR)
 # ---------------------------------------------------------------------------
 
 def mission_reliability(lambda_per_hour: float, t_hours: float) -> float:
     """
     Time-based reliability for constant-hazard component:
-        R(t) = exp(-λ · t)
+        R(t) = exp(-lambda * t)
     """
     return math.exp(-lambda_per_hour * t_hours)
 
 
-def generator_mission_prob(fts: float, lambda_run: float, t_hours: float) -> float:
+def generator_mission_prob(
+    fts: float,
+    lambda_run: float,
+    t_hours: float,
+    ftlr: float = 0.0,
+) -> float:
     """
-    Single-generator mission success for a STANDBY (demand + run) model:
-        P = (1 − FTS) · R(t)  =  (1 − FTS) · exp(−λ_run · t)
+    Single-generator mission success for a STANDBY (demand + run) model.
 
-    For a continuously-running islanded generator the FTS term is not
-    applicable to normal operation; use this only for extended-outage
+    Revised formula (NRC/INL 2022):
+        P = (1 - FTS) * (1 - FTLR) * exp(-lambda_run * t)
+
+    where:
+        FTS       = fail-to-start probability per demand
+        FTLR      = fail-to-load / early carry-load failure per demand
+        lambda_run= run-failure rate after first hour (failures per run-hour)
+        t         = mission duration in hours
+
+    For a continuously-running islanded generator the FTS and FTLR terms are
+    not applicable to normal operation; use this only for extended-outage
     mission analysis or start-after-maintenance scenarios.
     """
-    return (1.0 - fts) * mission_reliability(lambda_run, t_hours)
+    return (1.0 - fts) * (1.0 - ftlr) * mission_reliability(lambda_run, t_hours)
 
 
-def kofn_mission_prob(n: int, k: int, fts: float, lambda_run: float, t_hours: float) -> float:
+def kofn_mission_prob(
+    n: int,
+    k: int,
+    fts: float,
+    lambda_run: float,
+    t_hours: float,
+    ftlr: float = 0.0,
+) -> float:
     """k-of-n mission success for identical generators (standby model)."""
-    p_single = generator_mission_prob(fts, lambda_run, t_hours)
+    p_single = generator_mission_prob(fts, lambda_run, t_hours, ftlr)
     return kofn_availability(n, k, p_single)
 
 
@@ -138,7 +221,7 @@ def mixed_fleet_kofn_availability(
     Each group i contributes count_i independent units each with availability a_i.
     The number of working units follows the convolution of Binomial(n_i, a_i) RVs.
 
-    Method: numpy convolution of per-group PMFs — O(n_total²) but vectorised,
+    Method: numpy convolution of per-group PMFs — O(n_total^2) but vectorised,
             handles fleets of several hundred units in milliseconds.
 
     Parameters
@@ -161,7 +244,6 @@ def mixed_fleet_kofn_availability(
         return 0.0
 
     # Build the joint PMF iteratively via convolution.
-    # pmf[j] = P(exactly j units working across all groups processed so far).
     pmf = np.array([1.0])
 
     for count, avail in groups:
@@ -170,40 +252,43 @@ def mixed_fleet_kofn_availability(
             continue
         avail = float(np.clip(avail, 0.0, 1.0))
         q = 1.0 - avail
-        # Binomial PMF for this group
         group_pmf = np.array([
             math.comb(count, i) * (avail ** i) * (q ** (count - i))
             for i in range(count + 1)
         ])
         pmf = np.convolve(pmf, group_pmf)
 
-    # P(system works) = P(working units >= k)
     k = min(k, len(pmf) - 1)
     return float(np.sum(pmf[k:]))
 
 
 def mixed_fleet_mission_prob(
-    groups: List[tuple],   # List of (count: int, fts: float, lambda_run: float)
+    groups: List[tuple],   # List of (count: int, fts: float, ftlr: float, lambda_run: float)
     k: int,
     t_hours: float,
 ) -> float:
     """
     k-of-n mission success for a mixed generator fleet (demand + run model).
 
-    For each generator in group i:
-        p_mission_i = (1 − FTS_i) × exp(−λ_i × t)
+    Revised formula per NRC/INL 2022:
+        p_mission_i = (1 - FTS_i) * (1 - FTLR_i) * exp(-lambda_i * t)
 
     The system succeeds if at least k generators complete the mission.
 
     Parameters
     ----------
-    groups  : list of (count, fts_probability, lambda_run_per_hour)
+    groups  : list of (count, fts_probability, ftlr_probability, lambda_run_per_hour)
     k       : minimum generators required
     t_hours : mission duration
+
+    Notes
+    -----
+    Caller must pass 4-tuples. To isolate FTS contribution only, pass ftlr=0.0.
+    To isolate run contribution only, pass fts=0.0 and ftlr=0.0.
     """
     mission_groups = [
-        (count, (1.0 - fts) * mission_reliability(lam, t_hours))
-        for count, fts, lam in groups
+        (count, (1.0 - fts) * (1.0 - ftlr) * mission_reliability(lam, t_hours))
+        for count, fts, ftlr, lam in groups
     ]
     return mixed_fleet_kofn_availability(mission_groups, k)
 
@@ -212,8 +297,8 @@ def mixed_fleet_mission_prob(
 # Downtime conversion helpers
 # ---------------------------------------------------------------------------
 
-HOURS_PER_YEAR = 8_766.0        # 365.25 × 24
-MINUTES_PER_YEAR = 525_960.0    # 365.25 × 24 × 60
+HOURS_PER_YEAR = 8_766.0        # 365.25 * 24
+MINUTES_PER_YEAR = 525_960.0    # 365.25 * 24 * 60
 
 
 def annual_downtime_minutes(availability: float) -> float:
@@ -232,12 +317,12 @@ def delta_availability(
     baseline_avail: float,
     perturbed_avail: float,
 ) -> float:
-    """Signed change: perturbed − baseline."""
+    """Signed change: perturbed - baseline."""
     return perturbed_avail - baseline_avail
 
 
 def availability_to_nines(a: float) -> float:
-    """Number of 9s: e.g. 0.9999 → 4.0."""
+    """Number of 9s: e.g. 0.9999 -> 4.0."""
     if a <= 0:
         return 0.0
     if a >= 1:

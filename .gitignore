@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local preview / smoke-test artifacts (don't commit large generated PDFs)
+preview_*.pdf
+smoke_test_*.pdf
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local-only scripts and outputs
+_smoke_*.py

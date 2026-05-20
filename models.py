@@ -1,21 +1,25 @@
 """
 Topology configuration and system-level availability calculator.
 
-Generation tier now supports a **mixed fleet** of arbitrary size:
-  - Any number of generator groups, each with its own MTBF / MTTR / FTS
+Generation tier supports a **mixed fleet** of arbitrary size:
+  - Any number of generator groups, each with its own MTBF / MTTR / FTS / FTLR
   - k-of-n requirement set across the whole fleet (not per type)
   - Uses convolution-based k-of-n for non-identical groups (see reliability.py)
+
+Generator mission model (revised per NRC/INL 2022):
+  P_mission = (1 - FTS) * (1 - FTLR) * exp(-lambda_run * t)
+  where FTLR = fail-to-load / early carry-load failure per demand
 
 Topology structure
 ------------------
   Generation Fleet (mixed k-of-n)
-       │
-       ├─── Path A ─────────────────────────────────────────────────────────┐
-       │    [Para.SW] ► [Gen Brk] ► [MV Brk] ► [MV Bus] ► [ATS] ►        │
-       │    [XFMR] ► [LV Bus] ► [LV Brk] ► UPS (k-of-n) ► PDU ► IT PSU A │◄──┐
-       │                                                                    │   │ LOAD
-       └─── Path B ─────────────────────────────────────────────────────────┐   │ (1-of-2
-            (mirror of Path A) ► IT PSU B                                   │◄──┘  if 2N)
+       |
+       +--- Path A ----------------------------------------------------------+
+       |    [Para.SW] -> [Gen Brk] -> [MV Brk] -> [MV Bus] -> [ATS] ->     |
+       |    [XFMR] -> [LV Bus] -> [LV Brk] -> UPS (k-of-n) -> PDU -> PSU A |<--+
+       |                                                                     |   | LOAD
+       +--- Path B ---------------------------------------------- ---------+   | (1-of-2
+            (mirror of Path A) -> IT PSU B                                  |<--+  if 2N)
 
 For "Shared Pool" the single mixed k-of-n fleet feeds both distribution paths.
 For "Dedicated per Path" the fleet config is replicated per path independently.
@@ -35,6 +39,7 @@ from reliability import (
     mixed_fleet_kofn_availability,
     mixed_fleet_mission_prob,
     ccf_unavailability,
+    kofn_with_ccf,
     mission_reliability,
     annual_downtime_minutes,
     annual_downtime_hours,
@@ -55,12 +60,13 @@ class GeneratorGroup:
     For a mixed fleet (e.g. 60 small recip + 20 gas turbines + 10 fuel cells),
     create one GeneratorGroup per type/tier.
     """
-    name: str                    # user-assigned label, e.g. "Small Recip A"
-    count: int                   # number of units in this group
-    mtbf_hours: float            # continuous-running MTBF per unit (hours)
-    mttr_hours: float            # mean time to repair per unit (hours)
-    fts_probability: float       # fail-to-start probability (for mission analysis)
-    source: str = "Placeholder"  # data provenance note
+    name: str                     # user-assigned label, e.g. "Small Recip A"
+    count: int                    # number of units in this group
+    mtbf_hours: float             # continuous-running MTBF per unit (hours)
+    mttr_hours: float             # mean time to repair per unit (hours)
+    fts_probability: float        # fail-to-start probability per demand
+    ftlr_probability: float = 0.0 # fail-to-load / early carry-load per demand (NRC/INL)
+    source: str = "Placeholder"   # data provenance note
 
     @property
     def availability(self) -> float:
@@ -74,6 +80,12 @@ class GeneratorGroup:
     def unavailability(self) -> float:
         return 1.0 - self.availability
 
+    @property
+    def single_unit_mission_prob(self, t_hours: float = 96.0) -> float:
+        """Mission success for one unit at the default 96-hour duration."""
+        return (1.0 - self.fts_probability) * (1.0 - self.ftlr_probability) * \
+               mission_reliability(self.lambda_run, t_hours)
+
 
 def default_fleet() -> List[GeneratorGroup]:
     """Default starting fleet: 2 diesel generators (matches original default config)."""
@@ -85,6 +97,7 @@ def default_fleet() -> List[GeneratorGroup]:
             mtbf_hours=g.mtbf_hours,
             mttr_hours=g.mttr_hours,
             fts_probability=g.fts_probability,
+            ftlr_probability=g.ftlr_probability,
             source=g.source,
         )
     ]
@@ -101,20 +114,17 @@ class TopologyConfig:
     """
 
     # ── Prime movers (mixed fleet) ────────────────────────────────────────────
-    # gen_groups defines the fleet composition (per path if Dedicated, total if Shared).
     gen_groups: List[GeneratorGroup] = field(default_factory=default_fleet)
-
-    # Minimum generators required from the fleet:
-    #   Dedicated per Path → required per path
-    #   Shared Pool        → required across the whole pool
     gen_required: int = 1
-
-    # "Dedicated per Path" → each path has its own independent fleet (gen_groups is per path)
-    # "Shared Pool"        → one common fleet feeds all distribution paths
-    gen_arrangement: str = "Dedicated per Path"
+    gen_arrangement: str = "Dedicated per Path"  # or "Shared Pool"
 
     # ── Distribution paths ───────────────────────────────────────────────────
+    # num_paths   : total number of redundant power paths (1 to 6)
+    # paths_required (k): minimum paths required for system to be UP.
+    #   1-of-2 = 2N      |  2-of-3 = 3N/2     |  3-of-4 = 4N/3 or 3+1
+    #   For backward compat, paths_required=1 with num_paths=2 = existing 2N.
     num_paths: int = 2
+    paths_required: int = 1
 
     # Component toggles (applied identically to every path)
     include_paralleling_switchgear: bool = True
@@ -145,6 +155,14 @@ class TopologyConfig:
 
     # ── Mission analysis ─────────────────────────────────────────────────────
     mission_duration_hours: float = 96.0
+
+    # ── Power source mode ────────────────────────────────────────────────────
+    # "islanded"          — generator fleet IS the only source (default).
+    # "grid_with_backup"  — utility grid is primary; gen fleet is standby.
+    #                       Source availability = A_grid + U_grid * P_mission.
+    power_source_mode: str = "islanded"
+    grid_mtbf_hours: float = 8_760.0   # Default: ~1 grid outage per year
+    grid_mttr_hours: float = 2.0       # Default: 2-hour mean restoration
 
 
 # ---------------------------------------------------------------------------
@@ -181,11 +199,15 @@ class ComponentResult:
 @dataclass
 class PathResult:
     path_name: str
-    gen_fleet_availability: float
+    gen_fleet_availability: float          # raw backup-fleet availability (always populated)
     gen_fleet_desc: str
     components: List[ComponentResult]
     distribution_availability: float
     total_availability: float
+    # In grid_with_backup mode, source_availability is the combined grid + backup
+    # source feeding this path; in islanded mode, it equals gen_fleet_availability.
+    source_availability: float = 0.0
+    source_desc: str = ""
 
 
 @dataclass
@@ -196,10 +218,12 @@ class FleetMissionResult:
     duration_hours: float
     # Per-group single-unit mission success probabilities
     group_mission_probs: List[float]
+    group_start_probs: List[float]    # (1 - FTS) * (1 - FTLR) only
+    group_run_probs: List[float]      # exp(-lambda * t) only
     # System-level
     system_mission: float
-    system_fts_success: float    # k-of-n FTS only (no runtime failure)
-    system_run_success: float    # k-of-n run reliability only (perfect start)
+    system_fts_success: float    # k-of-n FTS+FTLR only (no runtime failure)
+    system_run_success: float    # k-of-n run reliability only (perfect start/load)
 
 
 @dataclass
@@ -215,10 +239,21 @@ class SystemResult:
     ccf_unavailability_contribution: Optional[float]
     independent_unavailability_contribution: Optional[float]
     fleet_mission: FleetMissionResult
-    sensitivity: Dict[str, float]   # label → min/yr recovered if perfect
+    sensitivity: Dict[str, float]   # label -> min/yr recovered if perfect
     # Fleet summary
     fleet_total_units: int
     fleet_weighted_avg_availability: float
+    # Calculation trace for audit
+    calc_trace: List[dict] = field(default_factory=list)
+    # ── Grid-connection result fields ────────────────────────────────────────
+    # power_source_mode mirrors config.power_source_mode for convenience.
+    # In "islanded": grid_* fields are None; source_availability == gen_fleet_a.
+    # In "grid_with_backup": all four fields are populated.
+    power_source_mode: str = "islanded"
+    grid_availability: Optional[float] = None
+    grid_mtbf_hours: Optional[float] = None
+    grid_mttr_hours: Optional[float] = None
+    source_availability: float = 0.0       # combined source feeding distribution
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +276,7 @@ def calculate_system(
         comp_overrides = {}
 
     params = resolve_comp_params(comp_overrides)
+    calc_trace = []  # audit trail
 
     groups = config.gen_groups
     if not groups:
@@ -253,7 +289,6 @@ def calculate_system(
 
     gen_fleet_a = mixed_fleet_kofn_availability(fleet_avail_groups, k_req)
 
-    # Summary metrics for the fleet
     total_units = n_total
     weighted_avg_a = sum(g.count * g.availability for g in groups) / n_total if n_total > 0 else 0.0
 
@@ -261,6 +296,90 @@ def calculate_system(
         f"Mixed fleet: {n_total} total units across {len(groups)} group(s), "
         f"{k_req} required"
     )
+
+    calc_trace.append({
+        "step": "Generator Fleet",
+        "method": f"Mixed k-of-n convolution ({k_req}-of-{n_total})",
+        "inputs": {f"Group '{g.name}' (x{g.count})": f"A={g.availability:.8f}" for g in groups},
+        "result": gen_fleet_a,
+        "formula": "A_fleet = P(sum of Binom(n_i, a_i) >= k) via PMF convolution",
+    })
+
+    # ── 1b. Fleet mission analysis (computed early so source can use it) ────
+    t = config.mission_duration_hours
+    mission_groups_params = [(g.count, g.fts_probability, g.ftlr_probability, g.lambda_run) for g in groups]
+    system_mission = mixed_fleet_mission_prob(mission_groups_params, k_req, t)
+    # FTS+FTLR only (lambda=0 means R(t)=1, perfect run reliability)
+    fts_only_groups = [(g.count, g.fts_probability, g.ftlr_probability, 0.0) for g in groups]
+    system_fts_success = mixed_fleet_mission_prob(fts_only_groups, k_req, t)
+    # Run only (FTS=0, FTLR=0 means start/load always succeeds)
+    run_only_groups = [(g.count, 0.0, 0.0, g.lambda_run) for g in groups]
+    system_run_success = mixed_fleet_mission_prob(run_only_groups, k_req, t)
+    group_mission_probs = [
+        (1.0 - g.fts_probability) * (1.0 - g.ftlr_probability) * mission_reliability(g.lambda_run, t)
+        for g in groups
+    ]
+    group_start_probs = [
+        (1.0 - g.fts_probability) * (1.0 - g.ftlr_probability)
+        for g in groups
+    ]
+    group_run_probs = [
+        mission_reliability(g.lambda_run, t)
+        for g in groups
+    ]
+    fleet_mission = FleetMissionResult(
+        groups=groups,
+        k_required=k_req,
+        duration_hours=t,
+        group_mission_probs=group_mission_probs,
+        group_start_probs=group_start_probs,
+        group_run_probs=group_run_probs,
+        system_mission=system_mission,
+        system_fts_success=system_fts_success,
+        system_run_success=system_run_success,
+    )
+
+    # ── 1c. Power source (grid + backup combination, if applicable) ─────────
+    # In islanded mode the gen fleet IS the source.  In grid_with_backup mode
+    # the source is `grid` in parallel with `backup-fleet-on-mission`:
+    #     A_source = A_grid + U_grid * P_backup_mission
+    # where P_backup_mission is evaluated at the user's mission_duration_hours
+    # (interpreted as the assumed worst-case grid outage duration).
+    grid_avail: Optional[float] = None
+    if config.power_source_mode == "grid_with_backup":
+        grid_avail = component_availability(config.grid_mtbf_hours, config.grid_mttr_hours)
+        u_grid = 1.0 - grid_avail
+        source_avail = grid_avail + u_grid * system_mission
+        source_desc = (
+            f"Grid (MTBF={config.grid_mtbf_hours:,.0f} h, "
+            f"MTTR={config.grid_mttr_hours:.2f} h) "
+            f"+ Backup ({n_total} units, {k_req} required)"
+        )
+        calc_trace.append({
+            "step": "Grid Connection",
+            "method": "Single-source MTBF/MTTR",
+            "inputs": {
+                "Grid MTBF": f"{config.grid_mtbf_hours:,.0f} h",
+                "Grid MTTR": f"{config.grid_mttr_hours:.2f} h",
+            },
+            "result": grid_avail,
+            "formula": "A_grid = MTBF / (MTBF + MTTR)",
+        })
+        calc_trace.append({
+            "step": "Combined Source (Grid + Backup)",
+            "method": "Source up if grid up OR (grid down AND backup mission succeeds)",
+            "inputs": {
+                "A_grid": f"{grid_avail:.8f}",
+                "U_grid": f"{u_grid:.4e}",
+                "P_backup_mission": f"{system_mission:.8f}",
+                "Assumed outage duration": f"{t:.0f} h",
+            },
+            "result": source_avail,
+            "formula": "A_source = A_grid + U_grid * P_mission",
+        })
+    else:
+        source_avail = gen_fleet_a
+        source_desc = f"Islanded - backup fleet IS the source ({gen_fleet_desc})"
 
     # ── 2. Distribution path components (series chain) ───────────────────────
     def build_dist_components(p: Dict[str, CompDef], cfg: TopologyConfig) -> List[ComponentResult]:
@@ -324,158 +443,221 @@ def calculate_system(
     dist_components = build_dist_components(params, config)
     dist_a = series_availability([c.availability for c in dist_components])
 
+    running_a = 1.0
+    for c in dist_components:
+        running_a *= c.availability
+        calc_trace.append({
+            "step": f"Dist. series: {c.label}",
+            "method": "Series multiply" + (f" [{c.kofn_desc}]" if c.is_kofn_group else ""),
+            "inputs": {"Component A": f"{c.availability:.8f}", "Running product": f"{running_a/c.availability:.8f}"},
+            "result": running_a,
+            "formula": "A_series = product(A_i)",
+        })
+
     # ── 3. Per-path total availability ───────────────────────────────────────
+    # Uses source_avail (= gen fleet in islanded mode, or grid+backup combined
+    # in grid mode) wherever gen fleet's continuous availability was used before.
     if config.gen_arrangement == "Dedicated per Path":
-        path_total_a = gen_fleet_a * dist_a
+        path_total_a = source_avail * dist_a
     else:
-        # Shared pool: each path's individual availability is just its dist chain.
-        # Gen pool failure is folded into system-level calc below.
         path_total_a = dist_a
+
+    # Resolve effective k_paths (paths_required), with sensible defaults
+    # for older configs that may not have it set explicitly.
+    k_paths = config.paths_required
+    if k_paths <= 0:
+        # Backward-compat default: 1 for any redundant config (2N pattern)
+        k_paths = 1 if config.num_paths >= 2 else 1
+    k_paths = max(1, min(k_paths, max(1, config.num_paths)))
+
+    # Path name generation (supports up to 26 paths using A-Z)
+    def _path_name(i: int, total: int) -> str:
+        if total == 1:
+            return "Path"
+        return f"Path {chr(ord('A') + i)}" if i < 26 else f"Path {i+1}"
 
     path_results = []
     for i in range(config.num_paths):
-        name = ["Path A", "Path B"][i] if config.num_paths == 2 else "Path"
         path_results.append(PathResult(
-            path_name=name,
+            path_name=_path_name(i, config.num_paths),
             gen_fleet_availability=gen_fleet_a,
             gen_fleet_desc=gen_fleet_desc,
             components=dist_components,
             distribution_availability=dist_a,
             total_availability=path_total_a,
+            source_availability=source_avail,
+            source_desc=source_desc,
         ))
 
     # ── 4. System availability ────────────────────────────────────────────────
+    # Unified k-of-n formulation: kofn_with_ccf reduces to the existing 2N
+    # formula for n=2, k=1, so prior numerical results are preserved.
     ccf_unavail_contrib = None
     indep_unavail_contrib = None
 
+    src_lbl = "Gen fleet" if config.power_source_mode == "islanded" \
+              else "Source (grid+backup)"
+
+    # Topology label for trace readability
     if config.num_paths == 1:
-        system_a = gen_fleet_a * dist_a
+        topo_label = "Single Path"
+    elif config.num_paths == 2 and k_paths == 1:
+        topo_label = "2N"
+    elif config.num_paths == 2 and k_paths == 2:
+        topo_label = "Series 2-of-2 (no redundancy)"
+    else:
+        topo_label = f"{config.num_paths}N/{k_paths} ({k_paths}-of-{config.num_paths})"
+
+    if config.num_paths == 1:
+        system_a = source_avail * dist_a
         ccf_applied = False
+        calc_trace.append({
+            "step": f"System ({topo_label})",
+            "method": f"Series: {src_lbl} x Distribution path",
+            "inputs": {src_lbl: f"{source_avail:.8f}", "Distribution": f"{dist_a:.8f}"},
+            "result": system_a,
+            "formula": "A_sys = A_source * A_dist",
+        })
 
-    else:  # 2-path dual-cord system
+    else:  # num_paths >= 2 — use unified k-of-n with CCF
+        beta = config.ccf_beta if config.enable_ccf else 0.0
+        ccf_applied = config.enable_ccf
+
         if config.gen_arrangement == "Dedicated per Path":
+            # Each path has its own source + dist chain; CCF couples them.
             u_path = 1.0 - path_total_a
-            if config.enable_ccf:
-                u_sys = ccf_unavailability(u_path, u_path, config.ccf_beta)
-                indep_unavail_contrib = (1.0 - config.ccf_beta) * u_path * u_path
-                ccf_unavail_contrib = config.ccf_beta * u_path
-                ccf_applied = True
-            else:
-                u_sys = u_path * u_path
-                ccf_applied = False
-            system_a = 1.0 - u_sys
-
-        else:  # Shared pool
-            u_gen = 1.0 - gen_fleet_a
-            u_dist = 1.0 - dist_a
-            if config.enable_ccf:
-                u_both_dist = ccf_unavailability(u_dist, u_dist, config.ccf_beta)
-                indep_unavail_contrib = (1.0 - config.ccf_beta) * u_dist * u_dist
-                ccf_unavail_contrib = config.ccf_beta * u_dist
-                ccf_applied = True
-            else:
-                u_both_dist = u_dist * u_dist
-                ccf_applied = False
-            u_sys = u_gen + gen_fleet_a * u_both_dist
+            a_kofn_indep = kofn_availability(config.num_paths, k_paths, path_total_a)
+            p_indep_fail = 1.0 - a_kofn_indep
+            ccf_unavail_contrib = beta * u_path
+            indep_unavail_contrib = (1.0 - beta) * p_indep_fail
+            u_sys = ccf_unavail_contrib + indep_unavail_contrib
             system_a = max(0.0, 1.0 - u_sys)
+            calc_trace.append({
+                "step": f"System ({topo_label}{' + CCF' if ccf_applied else ', no CCF'})",
+                "method": (
+                    f"k-of-n parallel with beta-factor CCF"
+                    f" (k={k_paths}, n={config.num_paths})"
+                ),
+                "inputs": {
+                    "U_path": f"{u_path:.2e}",
+                    "k of n": f"{k_paths} of {config.num_paths}",
+                    "beta": f"{beta:.3f}",
+                    "U_indep (binomial)": f"{indep_unavail_contrib:.2e}",
+                    "U_ccf": f"{ccf_unavail_contrib:.2e}",
+                },
+                "result": system_a,
+                "formula": "U_sys = beta * U_path + (1-beta) * P(< k of n paths up)",
+            })
+
+        else:  # Shared Pool — single source upstream, n dist paths with k-of-n
+            u_source = 1.0 - source_avail
+            u_dist = 1.0 - dist_a
+            a_dist_kofn_indep = kofn_availability(config.num_paths, k_paths, dist_a)
+            p_dist_indep_fail = 1.0 - a_dist_kofn_indep
+            ccf_unavail_contrib = beta * u_dist
+            indep_unavail_contrib = (1.0 - beta) * p_dist_indep_fail
+            u_dist_pool = ccf_unavail_contrib + indep_unavail_contrib
+            u_sys = u_source + source_avail * u_dist_pool
+            system_a = max(0.0, 1.0 - u_sys)
+            calc_trace.append({
+                "step": f"System (Shared Pool, {topo_label}"
+                        f"{' + CCF' if ccf_applied else ', no CCF'})",
+                "method": (
+                    f"Shared {src_lbl} + k-of-n dist paths with beta-factor CCF"
+                ),
+                "inputs": {
+                    "U_source": f"{u_source:.2e}",
+                    "U_dist (each)": f"{u_dist:.2e}",
+                    "k of n": f"{k_paths} of {config.num_paths}",
+                    "beta": f"{beta:.3f}",
+                    "U_dist_pool": f"{u_dist_pool:.2e}",
+                },
+                "result": system_a,
+                "formula": "U_sys = U_source + A_source * U_dist_pool",
+            })
 
     system_u = 1.0 - system_a
-
-    # ── 5. Mission analysis ───────────────────────────────────────────────────
-    t = config.mission_duration_hours
-    mission_groups_params = [(g.count, g.fts_probability, g.lambda_run) for g in groups]
-    system_mission = mixed_fleet_mission_prob(mission_groups_params, k_req, t)
-
-    # FTS-only and run-only contributions
-    fts_only_groups = [(g.count, g.fts_probability, 0.0) for g in groups]   # lambda=0 → R(t)=1
-    system_fts_success = mixed_fleet_mission_prob(fts_only_groups, k_req, t)
-
-    run_only_groups = [(g.count, 0.0, g.lambda_run) for g in groups]        # FTS=0 → start always
-    system_run_success = mixed_fleet_mission_prob(run_only_groups, k_req, t)
-
-    group_mission_probs = [
-        (1.0 - g.fts_probability) * mission_reliability(g.lambda_run, t)
-        for g in groups
-    ]
-
-    fleet_mission = FleetMissionResult(
-        groups=groups,
-        k_required=k_req,
-        duration_hours=t,
-        group_mission_probs=group_mission_probs,
-        system_mission=system_mission,
-        system_fts_success=system_fts_success,
-        system_run_success=system_run_success,
-    )
 
     # ── 6. Sensitivity ────────────────────────────────────────────────────────
     sensitivity: Dict[str, float] = {}
 
-    def _sys_avail_with_fleet(fleet_a_override: float) -> float:
-        """System availability if gen fleet availability = fleet_a_override."""
+    _beta_eff = config.ccf_beta if config.enable_ccf else 0.0
+
+    def _sys_avail_with_source(source_a_override: float) -> float:
+        """Recompute system availability with a hypothetical source availability."""
         if config.num_paths == 1:
-            return fleet_a_override * dist_a
+            return source_a_override * dist_a
         if config.gen_arrangement == "Dedicated per Path":
-            path_a = fleet_a_override * dist_a
-            u_p = 1.0 - path_a
-            if config.enable_ccf:
-                u_s = ccf_unavailability(u_p, u_p, config.ccf_beta)
-            else:
-                u_s = u_p * u_p
-            return 1.0 - u_s
+            u_p = 1.0 - (source_a_override * dist_a)
+            return 1.0 - kofn_with_ccf(config.num_paths, k_paths, u_p, _beta_eff)
         else:
-            u_g = 1.0 - fleet_a_override
             u_d = 1.0 - dist_a
-            if config.enable_ccf:
-                u_b = ccf_unavailability(u_d, u_d, config.ccf_beta)
-            else:
-                u_b = u_d * u_d
-            return max(0.0, 1.0 - (u_g + fleet_a_override * u_b))
+            u_pool = kofn_with_ccf(config.num_paths, k_paths, u_d, _beta_eff)
+            u_src = 1.0 - source_a_override
+            return max(0.0, 1.0 - (u_src + source_a_override * u_pool))
 
     def _sys_avail_with_dist(dist_a_override: float) -> float:
-        """System availability if distribution path availability = dist_a_override."""
         if config.num_paths == 1:
-            return gen_fleet_a * dist_a_override
+            return source_avail * dist_a_override
         if config.gen_arrangement == "Dedicated per Path":
-            path_a = gen_fleet_a * dist_a_override
-            u_p = 1.0 - path_a
-            if config.enable_ccf:
-                u_s = ccf_unavailability(u_p, u_p, config.ccf_beta)
-            else:
-                u_s = u_p * u_p
-            return 1.0 - u_s
+            u_p = 1.0 - (source_avail * dist_a_override)
+            return 1.0 - kofn_with_ccf(config.num_paths, k_paths, u_p, _beta_eff)
         else:
-            u_g = 1.0 - gen_fleet_a
             u_d = 1.0 - dist_a_override
-            if config.enable_ccf:
-                u_b = ccf_unavailability(u_d, u_d, config.ccf_beta)
-            else:
-                u_b = u_d * u_d
-            return max(0.0, 1.0 - (u_g + gen_fleet_a * u_b))
+            u_pool = kofn_with_ccf(config.num_paths, k_paths, u_d, _beta_eff)
+            u_src = 1.0 - source_avail
+            return max(0.0, 1.0 - (u_src + source_avail * u_pool))
 
-    # Gen fleet: perfect fleet (all groups at 100%)
-    perfect_fleet_a = _sys_avail_with_fleet(1.0)
-    fleet_delta_min = annual_downtime_minutes(system_a) - annual_downtime_minutes(perfect_fleet_a)
-    sensitivity[f"Generator Fleet ({n_total} units, {k_req} required)"] = fleet_delta_min
+    # ─ Source (top-level) sensitivity ────────────────────────────────────────
+    perfect_source_a = _sys_avail_with_source(1.0)
+    source_delta_min = annual_downtime_minutes(system_a) - annual_downtime_minutes(perfect_source_a)
+    if config.power_source_mode == "grid_with_backup":
+        source_label = (
+            f"Source (Grid + Backup) - any one perfectly reliable. "
+            f"Grid: MTBF={config.grid_mtbf_hours:,.0f}h, MTTR={config.grid_mttr_hours:.1f}h"
+        )
+    else:
+        source_label = f"Generator Fleet ({n_total} units, {k_req} required)"
+    sensitivity[source_label] = source_delta_min
 
-    # Per-group sensitivity: what if this group were doubled in availability?
+    # ─ Grid-only sensitivity (grid_with_backup mode only) ────────────────────
+    # "What if just the grid feed had infinite MTBF, with backup unchanged?"
+    # In the OR-redundancy model this yields the same delta as making the
+    # backup perfect, but it's reported separately so the user can see that
+    # the grid quality matters at all.
+    if config.power_source_mode == "grid_with_backup":
+        # source_avail with A_grid = 1 -> source = 1.  Same delta as above,
+        # but labeled clearly so it's visible in the report.
+        sensitivity[
+            f"  -> Grid feed alone (MTBF={config.grid_mtbf_hours:,.0f}h)"
+        ] = source_delta_min
+
+    # ─ Per-group sensitivity ────────────────────────────────────────────────
+    # In islanded mode, "perfect group" -> higher fleet availability -> higher source.
+    # In grid mode, this is an approximation (uses continuous availability proxy
+    # for the group's contribution; the true effect would route through mission
+    # probability with lambda_run -> 0). Sufficient for screening; flagged in docs.
     for i, grp in enumerate(groups):
         if grp.count == 0:
             continue
-        # Replace this group with perfect-availability version
         perfect_groups = [(g.count, 1.0 if j == i else g.availability)
                           for j, g in enumerate(groups)]
         perf_fleet_a = mixed_fleet_kofn_availability(perfect_groups, k_req)
-        perf_sys_a = _sys_avail_with_fleet(perf_fleet_a)
+        if config.power_source_mode == "grid_with_backup":
+            # Carry perf_fleet_a through the source combination
+            u_g_now = 1.0 - (grid_avail or 1.0)
+            perf_source_a = (grid_avail or 1.0) + u_g_now * perf_fleet_a
+        else:
+            perf_source_a = perf_fleet_a
+        perf_sys_a = _sys_avail_with_source(perf_source_a)
         delta = annual_downtime_minutes(system_a) - annual_downtime_minutes(perf_sys_a)
         if abs(delta) > 1e-9:
-            sensitivity[f"  → {grp.name} (×{grp.count} units, A={grp.availability*100:.4f}%)"] = delta
+            sensitivity[f"  -> {grp.name} (x{grp.count} units, A={grp.availability*100:.4f}%)"] = delta
 
-    # Distribution components
+    # ─ Distribution components ──────────────────────────────────────────────
     for comp in dist_components:
         if comp.availability >= 1.0:
             continue
-        # Perfect this component
         perfect_comps_avails = [
             1.0 if c.label == comp.label else c.availability
             for c in dist_components
@@ -486,18 +668,35 @@ def calculate_system(
         if abs(delta) > 1e-9:
             sensitivity[comp.label] = delta
 
-    # CCF sensitivity
-    if config.enable_ccf and config.num_paths > 1:
-        if config.gen_arrangement == "Dedicated per Path":
-            u_p = 1.0 - path_total_a
-            a_no_ccf = 1.0 - u_p * u_p
-        else:
-            u_d = 1.0 - dist_a
-            u_g = 1.0 - gen_fleet_a
-            a_no_ccf = max(0.0, 1.0 - (u_g + gen_fleet_a * u_d * u_d))
-        ccf_delta = annual_downtime_minutes(system_a) - annual_downtime_minutes(a_no_ccf)
-        if abs(ccf_delta) > 1e-9:
-            sensitivity[f"CCF Beta Factor (b = {config.ccf_beta:.3f})"] = ccf_delta
+    # CCF sensitivity ladder — three rungs at decreasing beta values, so the
+    # tornado chart shows the marginal value of design diversification (not
+    # just the "perfect independence" extreme).
+    if config.enable_ccf and config.num_paths > 1 and config.ccf_beta > 0:
+        base_dt = annual_downtime_minutes(system_a)
+
+        def _system_avail_at_beta(beta_new: float) -> float:
+            if config.gen_arrangement == "Dedicated per Path":
+                u_p = 1.0 - path_total_a
+                return 1.0 - kofn_with_ccf(config.num_paths, k_paths, u_p, beta_new)
+            else:
+                u_d = 1.0 - dist_a
+                u_pool = kofn_with_ccf(config.num_paths, k_paths, u_d, beta_new)
+                u_src = 1.0 - source_avail
+                return max(0.0, 1.0 - (u_src + source_avail * u_pool))
+
+        beta_ladder = [
+            (config.ccf_beta * 0.5,  "halved"),
+            (config.ccf_beta * 0.25, "quartered"),
+            (0.0,                    "= 0 (perfect independence)"),
+        ]
+        for beta_new, descriptor in beta_ladder:
+            a_new = _system_avail_at_beta(beta_new)
+            delta = base_dt - annual_downtime_minutes(a_new)
+            if abs(delta) > 1e-9:
+                sensitivity[
+                    f"CCF beta {descriptor}  "
+                    f"(b = {beta_new:.4f} vs current {config.ccf_beta:.3f})"
+                ] = delta
 
     return SystemResult(
         config=config,
@@ -514,6 +713,15 @@ def calculate_system(
         sensitivity=sensitivity,
         fleet_total_units=total_units,
         fleet_weighted_avg_availability=weighted_avg_a,
+        calc_trace=calc_trace,
+        # ── Grid-connection result fields ────────────────────────────────────
+        power_source_mode=config.power_source_mode,
+        grid_availability=grid_avail,
+        grid_mtbf_hours=(config.grid_mtbf_hours
+                         if config.power_source_mode == "grid_with_backup" else None),
+        grid_mttr_hours=(config.grid_mttr_hours
+                         if config.power_source_mode == "grid_with_backup" else None),
+        source_availability=source_avail,
     )
 
 
@@ -531,11 +739,12 @@ def sweep_parameter(
     Sweep one parameter over a range of values and return system availabilities.
 
     sweep_key options:
-      "gen_fleet_scale"         → scale ALL gen MTBFs by the given multiplier
-      "gen_fts_all"             → set ALL groups' FTS probability to the given value
-      "gen_group_mtbf_{i}"      → set group i's MTBF to the value
-      "ccf_beta"                → vary CCF beta
-      "<comp_key>"              → vary that component's MTBF (MTTR held constant)
+      "gen_fleet_scale"         -> scale ALL gen MTBFs by the given multiplier
+      "gen_fts_all"             -> set ALL groups' FTS probability to the given value
+      "gen_ftlr_all"            -> set ALL groups' FTLR probability to the given value
+      "gen_group_mtbf_{i}"      -> set group i's MTBF to the value
+      "ccf_beta"                -> vary CCF beta
+      "<comp_key>"              -> vary that component's MTBF (MTTR held constant)
     """
     results = []
     for v in values:
@@ -549,6 +758,7 @@ def sweep_parameter(
                     mtbf_hours=max(1.0, g.mtbf_hours * v),
                     mttr_hours=g.mttr_hours,
                     fts_probability=g.fts_probability,
+                    ftlr_probability=g.ftlr_probability,
                     source=g.source,
                 )
                 for g in config.gen_groups
@@ -559,6 +769,18 @@ def sweep_parameter(
                     name=g.name, count=g.count,
                     mtbf_hours=g.mtbf_hours, mttr_hours=g.mttr_hours,
                     fts_probability=max(0.0, min(1.0, v)),
+                    ftlr_probability=g.ftlr_probability,
+                    source=g.source,
+                )
+                for g in config.gen_groups
+            ]
+        elif sweep_key == "gen_ftlr_all":
+            cfg.gen_groups = [
+                GeneratorGroup(
+                    name=g.name, count=g.count,
+                    mtbf_hours=g.mtbf_hours, mttr_hours=g.mttr_hours,
+                    fts_probability=g.fts_probability,
+                    ftlr_probability=max(0.0, min(1.0, v)),
                     source=g.source,
                 )
                 for g in config.gen_groups
@@ -573,6 +795,7 @@ def sweep_parameter(
                     mtbf_hours=max(1.0, v),
                     mttr_hours=g.mttr_hours,
                     fts_probability=g.fts_probability,
+                    ftlr_probability=g.ftlr_probability,
                     source=g.source,
                 )
             cfg.gen_groups = new_groups
