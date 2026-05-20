@@ -40,6 +40,7 @@ from reliability import (
     mission_reliability, kofn_availability,
 )
 from pdf_report import build_pdf_report
+from diagrams import build_topology_diagram
 
 
 # ---------------------------------------------------------------------------
@@ -1816,6 +1817,89 @@ def render_audit_tab(result, config: TopologyConfig, comp_overrides: dict):
 # Tab: Methodology
 # ---------------------------------------------------------------------------
 
+def render_diagram_tab(result, comp_overrides: dict):
+    """Render the System Diagram tab — a graphviz topology view with
+    per-component reliability annotations and a PNG download."""
+    st.header("System Topology Diagram")
+    st.caption(
+        "Auto-generated from your current configuration.  Each block shows a "
+        "component (or k-of-n group) with its reliability number.  Border color "
+        "indicates data provenance.  Use the controls below to switch what "
+        "number is shown on each block."
+    )
+
+    # ── Controls ──────────────────────────────────────────────────────────
+    c1, c2, c3 = st.columns([2, 2, 3])
+
+    annotation_label = c1.radio(
+        "Show on each block",
+        options=["availability", "downtime", "unavailability"],
+        index=0,
+        format_func=lambda x: {
+            "availability":   "Availability (%)",
+            "downtime":       "Downtime (min/yr)",
+            "unavailability": "Unavailability (ppm)",
+        }[x],
+        horizontal=False,
+        key="diagram_annotation",
+    )
+
+    highlight = c2.checkbox(
+        "Highlight top bottleneck (red)",
+        value=True,
+        help=(
+            "Outlines the single component contributing the most to system "
+            "downtime in red. Pulled from the sensitivity ranking."
+        ),
+        key="diagram_highlight",
+    )
+
+    with c3:
+        st.markdown("**Legend**")
+        st.markdown(
+            "<small>"
+            "🟢 Specified (published source)  &nbsp;|&nbsp; "
+            "🟡 Placeholder (replace with OEM data)<br/>"
+            "🔵 User override  &nbsp;|&nbsp; "
+            "🔴 Top sensitivity contributor"
+            "</small>",
+            unsafe_allow_html=True,
+        )
+
+    # ── Build the diagram ─────────────────────────────────────────────────
+    dot_string = build_topology_diagram(
+        result,
+        comp_overrides=comp_overrides,
+        annotation=annotation_label,
+        highlight_bottleneck=highlight,
+    )
+
+    st.graphviz_chart(dot_string, use_container_width=True)
+
+    # ── PNG download (best-effort; needs `dot` binary on PATH) ────────────
+    st.divider()
+    st.markdown("**Export the diagram**")
+    try:
+        import graphviz as _gv
+        png_bytes = _gv.Source(dot_string).pipe(format="png")
+        st.download_button(
+            "📥 Download diagram as PNG",
+            data=png_bytes,
+            file_name=f"ram_topology_{datetime.date.today()}.png",
+            mime="image/png",
+        )
+    except Exception as exc:
+        st.info(
+            f"PNG download not available in this environment "
+            f"({type(exc).__name__}: {exc}).  The interactive diagram above "
+            "still works — right-click → Save image to grab it."
+        )
+
+    # ── Show the DOT source (for transparency / debugging) ───────────────
+    with st.expander("Show graphviz DOT source", expanded=False):
+        st.code(dot_string, language="dot")
+
+
 def render_methodology_tab(result):
     st.header("Methodology & Assumptions")
     st.subheader("Scope")
@@ -1961,13 +2045,14 @@ def main():
 
     (tab_fleet, tab_results, tab_params,
      tab_sensitivity, tab_mission,
-     tab_compare, tab_audit,
+     tab_diagram, tab_compare, tab_audit,
      tab_method) = st.tabs([
         "🏭 Generator Fleet",
         "📊 Results",
         "🔧 Elec. Components",
         "📈 Sensitivity",
         "🔋 Mission Analysis",
+        "📐 System Diagram",
         "🔄 Topology Compare",
         "🔍 Audit & QA",
         "📚 Methodology",
@@ -1987,6 +2072,9 @@ def main():
 
     with tab_mission:
         render_mission_tab(result)
+
+    with tab_diagram:
+        render_diagram_tab(result, comp_overrides)
 
     with tab_compare:
         render_compare_tab(result)
