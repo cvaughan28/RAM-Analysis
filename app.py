@@ -41,6 +41,7 @@ from reliability import (
 )
 from pdf_report import build_pdf_report
 from diagrams import build_topology_diagram
+from sld import build_sld, sld_to_png_bytes
 
 
 # ---------------------------------------------------------------------------
@@ -1818,21 +1819,44 @@ def render_audit_tab(result, config: TopologyConfig, comp_overrides: dict):
 # ---------------------------------------------------------------------------
 
 def render_diagram_tab(result, comp_overrides: dict):
-    """Render the System Diagram tab — a graphviz topology view with
-    per-component reliability annotations and a PNG download."""
+    """Render the System Diagram tab — toggle between RBD (graphviz labeled
+    blocks) and SLD (matplotlib electrical symbols)."""
     st.header("System Topology Diagram")
+
+    # ── View toggle: RBD vs SLD ──────────────────────────────────────────
+    view = st.radio(
+        "Diagram style",
+        options=["RBD", "SLD"],
+        index=0,
+        format_func=lambda v: {
+            "RBD": "📦 Reliability Block Diagram (labeled blocks, auto-layout)",
+            "SLD": "⚡ Single-Line Diagram (simplified electrical symbols)",
+        }[v],
+        horizontal=True,
+        key="diagram_view_toggle",
+        help=(
+            "**RBD** shows each component / k-of-n group as a labeled box, "
+            "color-coded by data provenance. Easier to read at a glance and "
+            "shows the reliability math structure.\n\n"
+            "**SLD** shows the same topology using simplified IEEE-style "
+            "electrical symbols (gen circle, transformer two-coil, breaker "
+            "square, UPS, battery, etc.). Looks closer to an electrical "
+            "engineering drawing."
+        ),
+    )
+    st.divider()
+
     st.caption(
-        "Auto-generated from your current configuration.  Each block shows a "
-        "component (or k-of-n group) with its reliability number.  Border color "
+        "Auto-generated from your current configuration.  Border / outline color "
         "indicates data provenance.  Use the controls below to switch what "
-        "number is shown on each block."
+        "reliability number is shown on each component."
     )
 
     # ── Controls ──────────────────────────────────────────────────────────
     c1, c2, c3 = st.columns([2, 2, 3])
 
     annotation_label = c1.radio(
-        "Show on each block",
+        "Show on each component",
         options=["availability", "downtime", "unavailability"],
         index=0,
         format_func=lambda x: {
@@ -1866,38 +1890,75 @@ def render_diagram_tab(result, comp_overrides: dict):
             unsafe_allow_html=True,
         )
 
-    # ── Build the diagram ─────────────────────────────────────────────────
-    dot_string = build_topology_diagram(
-        result,
-        comp_overrides=comp_overrides,
-        annotation=annotation_label,
-        highlight_bottleneck=highlight,
-    )
-
-    st.graphviz_chart(dot_string, use_container_width=True)
-
-    # ── PNG download (best-effort; needs `dot` binary on PATH) ────────────
     st.divider()
-    st.markdown("**Export the diagram**")
-    try:
-        import graphviz as _gv
-        png_bytes = _gv.Source(dot_string).pipe(format="png")
-        st.download_button(
-            "📥 Download diagram as PNG",
-            data=png_bytes,
-            file_name=f"ram_topology_{datetime.date.today()}.png",
-            mime="image/png",
+
+    # ── Render the chosen view ───────────────────────────────────────────
+    if view == "RBD":
+        dot_string = build_topology_diagram(
+            result,
+            comp_overrides=comp_overrides,
+            annotation=annotation_label,
+            highlight_bottleneck=highlight,
         )
-    except Exception as exc:
-        st.info(
-            f"PNG download not available in this environment "
-            f"({type(exc).__name__}: {exc}).  The interactive diagram above "
-            "still works — right-click → Save image to grab it."
+        st.graphviz_chart(dot_string, use_container_width=True)
+
+        # PNG download (best-effort)
+        st.markdown("**Export the diagram**")
+        try:
+            import graphviz as _gv
+            png_bytes = _gv.Source(dot_string).pipe(format="png")
+            st.download_button(
+                "📥 Download RBD as PNG",
+                data=png_bytes,
+                file_name=f"ram_rbd_{datetime.date.today()}.png",
+                mime="image/png",
+                key="rbd_png_dl",
+            )
+        except Exception as exc:
+            st.info(
+                f"PNG download not available in this environment "
+                f"({type(exc).__name__}: {exc}).  The interactive diagram "
+                "above still works — right-click → Save image to grab it."
+            )
+
+        with st.expander("Show graphviz DOT source", expanded=False):
+            st.code(dot_string, language="dot")
+
+    else:  # SLD view
+        with st.spinner("Drawing single-line diagram…"):
+            fig = build_sld(
+                result,
+                comp_overrides=comp_overrides,
+                annotation=annotation_label,
+                highlight_bottleneck=highlight,
+            )
+        st.pyplot(fig, use_container_width=True)
+
+        # PNG download from the matplotlib figure
+        st.markdown("**Export the diagram**")
+        png_bytes = sld_to_png_bytes(fig)
+        st.download_button(
+            "📥 Download SLD as PNG",
+            data=png_bytes,
+            file_name=f"ram_sld_{datetime.date.today()}.png",
+            mime="image/png",
+            key="sld_png_dl",
         )
 
-    # ── Show the DOT source (for transparency / debugging) ───────────────
-    with st.expander("Show graphviz DOT source", expanded=False):
-        st.code(dot_string, language="dot")
+        # Important caveat about the SLD scope
+        st.info(
+            "**About this SLD:**  This is a *simplified* representation using "
+            "common IEEE-style symbols — not a CAD-grade single-line drawing.  "
+            "Use it to verify the topology that the RAM model is calculating "
+            "against, not as a substitute for the project's actual electrical "
+            "engineering drawings.  Backup gens are drawn to the left of each "
+            "path's main vertical chain to keep the layout readable; in a real "
+            "SLD they'd typically be on the alternate side of an ATS."
+        )
+
+        # Avoid memory accumulation: close the figure after rendering
+        import matplotlib.pyplot as _plt
+        _plt.close(fig)
 
 
 def render_methodology_tab(result):
