@@ -284,21 +284,24 @@ COMP_DEFAULTS: dict[str, CompDef] = {
 
     "ats_transfer_switch": CompDef(
         display_name="ATS / Transfer Switch",
-        mtbf_hours=1_428_571,
-        mttr_hours=3.6,
-        is_placeholder=True,
-        confidence="Low",
+        # IEEE 3006.8-2018 Table 2, aggregated data for "Switch, automatic transfer":
+        # lambda = 0.03502 failures/year -> MTBF = 8760/0.03502 = 250,143 h
+        # MTTR = 7.89 h.  Inherent availability = 0.999968.
+        mtbf_hours=250_143,
+        mttr_hours=7.89,
+        is_placeholder=False,
+        confidence="Medium",
         source=(
-            "PLACEHOLDER — IEEE 493 switch/disconnect proxy (lambda = 0.70 / 10^6 h). "
-            "ATS-specific open values are not available; use OEM data. "
-            "Revised RAM study notes: mechanical ATS has no strong public MTBF; "
-            "this placeholder must be replaced with installed-model OEM data."
+            "IEEE 3006.8-2018 Table 2, aggregated 'Switch, automatic transfer' "
+            "data — lambda = 0.03502 failures/year, MTTR = 7.89 h. "
+            "Replace with installed-model OEM data for final design assurance."
         ),
         notes=(
-            "Transfer switch / automatic transfer switch. IEEE 493 provides a "
-            "switch/disconnect screening value. ATS-specific OEM data (demand-failure "
-            "probability and time-based MTBF) should replace this for the final model. "
-            "Recommended MTTR with stocked actuator/controller: 2-4 h."
+            "Open-transition ATS, 3-phase 4-wire, aggregated industry data. "
+            "IEEE 3006.8 is the consolidated update to IEEE 493 reliability tables. "
+            "OEM-specific demand-failure rates can vary substantially — for "
+            "modern microprocessor-controlled ATSes with stocked spares, actual "
+            "availability is often better than this published mean."
         ),
     ),
 
@@ -346,31 +349,56 @@ COMP_DEFAULTS: dict[str, CompDef] = {
 
     "transformer": CompDef(
         display_name="Step-Down Transformer (MV -> LV)",
-        mtbf_hours=1_000_000,
-        mttr_hours=168.0,
-        is_placeholder=True,
-        confidence="Low",
+        # IEEE 493 Gold Book Table 10-15 / IEEE 3006.8-2018, 5 MVA substation
+        # transformer, liquid-filled, 35 kV primary / 480 V secondary:
+        # lambda = 0.011 failures/year -> MTBF = 8760/0.011 = 796,364 h
+        # MTTR = 5.0 h.  Inherent availability = 0.999994.
+        mtbf_hours=796_364,
+        mttr_hours=5.0,
+        is_placeholder=False,
+        confidence="High",
         source=(
-            "PLACEHOLDER — IEEE 493 power transformer data exists; "
-            "use kVA/voltage-class-specific values."
+            "IEEE 493 Gold Book Table 10-15 / IEEE 3006.8-2018 — 5 MVA "
+            "substation transformer, liquid-filled, 35 kV primary delta / "
+            "480 V secondary wye. lambda = 0.011 failures/year, MTTR = 5 h. "
+            "Major-fault repair (winding rewind) can extend MTTR to 168+ h; "
+            "the 5 h figure reflects typical fuse/auxiliary fault repair."
         ),
         notes=(
-            "Distribution transformer reliability varies by voltage class, kVA rating, "
-            "and age. IEEE 493 provides equipment data. MTTR is long for winding "
-            "failures; short for fuse/auxiliary faults. Use kVA-class-specific data."
+            "Reliability varies by voltage class, kVA rating, type "
+            "(dry vs liquid), and age. For different sizing/configuration "
+            "consult IEEE 493 for the relevant table row. Dry-type 75 kVA "
+            "step-downs (480->120V) have much higher MTBF (~3.3M h per IEEE)."
         ),
     ),
 
     # ── LV switchgear ────────────────────────────────────────────────────────
 
     "lv_bus_section": CompDef(
-        display_name="LV Bus Section / LV Busway",
-        mtbf_hours=5_000_000,
-        mttr_hours=4.0,
-        is_placeholder=True,
-        confidence="Low",
-        source="PLACEHOLDER — IEEE 493 bus data.",
-        notes="LV bus/busway is passive; bus failures are rare. Use IEEE 493.",
+        display_name="LV Bus Section / LV Switchboard",
+        # IEEE 3006.8-2018 Table 2, "Distribution panel / Switchboard > 225 A"
+        # (covers the typical 480V 1200A switchboard):
+        # lambda = 0.004327 failures/year -> MTBF = 8760/0.004327 = 2,024,500 h
+        # MTTR = 16.0 h.  Inherent availability = 0.999992.
+        mtbf_hours=2_024_500,
+        mttr_hours=16.0,
+        is_placeholder=False,
+        confidence="Medium",
+        source=(
+            "IEEE 3006.8-2018 Table 2 — 'Distribution panel / Switchboard > 225 A' "
+            "covering typical 480V 1200A switchboard configuration. "
+            "lambda = 0.004327 failures/year, MTTR = 16 h. "
+            "Longer MTTR reflects bus-section repair complexity (de-energized "
+            "work, sectionalizing). For purely passive busway runs, MTTR can be "
+            "shorter; for switchgear-cell repairs, longer."
+        ),
+        notes=(
+            "Covers LV bus sections and LV switchboards. Drawout-type 3000A "
+            "switchgear (which is more complex) is closer to lambda = 0.00949/yr "
+            "with MTTR ~7.3 h per IEEE 3006.8 (use paralleling_switchgear key if "
+            "you want to model that separately). LV busway is more reliable than "
+            "switchboard but the difference is second-order at this MTBF level."
+        ),
     ),
 
     "lv_breaker": CompDef(
