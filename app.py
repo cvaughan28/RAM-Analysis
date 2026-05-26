@@ -533,34 +533,13 @@ def render_sidebar():
     if enable_ccf:
         ccf_beta = st.sidebar.slider("CCF beta", 0.001, 0.20, 0.02, 0.001, format="%.3f")
 
-    st.sidebar.header("Mission Analysis")
-    mission_hours = st.sidebar.number_input(
-        "Mission duration (hours)",
-        min_value=1.0, max_value=8760.0, value=96.0, step=1.0,
-        help=(
-            "How long the backup fleet must carry the load on a single demand. "
-            "Reference values: 96 h = ~4-day worst-case outage; 168 h = 1 week; "
-            "720 h = 1 month; 8760 h = 1 year. "
-            "Note: for missions >~250-500 h the constant-MTBF mission model "
-            "is conservative -- it assumes lambda = 1/MTBF applies for the "
-            "full duration without any PM, oil changes, or refueling. Real "
-            "generators receive maintenance during long runs that this model "
-            "does not credit. For full-year planning horizons, also check the "
-            "steady-state fleet availability (Results tab, which is "
-            "independent of mission duration)."
-        ),
-    )
-    # Friendly day/week display for any value above 24 h
-    if mission_hours >= 24:
-        if mission_hours < 24 * 14:
-            _dur_caption = f"= {mission_hours / 24:.1f} days"
-        elif mission_hours < 24 * 90:
-            _dur_caption = f"= {mission_hours / (24 * 7):.1f} weeks"
-        elif mission_hours < 24 * 365:
-            _dur_caption = f"= {mission_hours / (24 * 30.44):.1f} months"
-        else:
-            _dur_caption = f"= {mission_hours / 8760:.2f} years"
-        st.sidebar.caption(_dur_caption)
+    # Mission duration is no longer in the main sidebar — it's been moved to the
+    # Mission Analysis tab as an informational, tab-local input.  For grid+backup
+    # mode the source availability calc uses the integrated formula (Option A)
+    # with grid MTTR, so no user-chosen mission duration is needed for system
+    # availability.  For islanded mode mission duration was always informational.
+    # Read the current tab-local value (set by render_mission_tab); default 24 h.
+    mission_hours = float(st.session_state.get("mission_hours_local", 24.0))
 
     config = TopologyConfig(
         gen_groups=get_fleet(),
@@ -1129,6 +1108,64 @@ def render_mission_tab(result):
         "Where: FTS = fail-to-start, FTLR = fail-to-load/run, λ = run-failure rate.  \n"
         "Ref: NREL 2020 (NREL/TP-5D00-76553), NRC/INL 2022 EPS EDG performance."
     )
+
+    # ── Tab-local mission duration input ─────────────────────────────────
+    # This input is purely informational — it controls only the numbers shown
+    # on this tab.  System availability (Results tab, PDF headline) is computed
+    # independently using grid MTTR for grid+backup mode, and continuous fleet
+    # availability for islanded mode.  See Methodology tab for details.
+    st.info(
+        "**Informational tab.**  The duration below is used for *this tab only* "
+        "to answer 'what's the chance of a successful X-hour run?'.  It does NOT "
+        "affect the system availability or annual downtime numbers shown elsewhere — "
+        "those use the grid MTTR (grid+backup mode) or continuous fleet availability "
+        "(islanded mode) and don't require a mission duration input.",
+        icon="ℹ️",
+    )
+
+    # Reasonable default: grid MTTR for grid+backup, 24 h for islanded
+    if result.config.power_source_mode == "grid_with_backup":
+        _default_t = float(result.config.grid_mttr_hours)
+    else:
+        _default_t = 24.0
+
+    if "mission_hours_local" not in st.session_state:
+        st.session_state["mission_hours_local"] = _default_t
+
+    c_inp, c_help = st.columns([1, 2])
+    mission_hours_local = c_inp.number_input(
+        "Mission duration to evaluate (hours)",
+        min_value=1.0, max_value=8760.0,
+        step=1.0,
+        key="mission_hours_local",
+        help=(
+            "Used by the metrics on this tab only.  For grid+backup mode the "
+            "default equals the configured grid MTTR (representing the typical "
+            "outage event).  Try 24 h, 96 h, 720 h, 8760 h to see how the "
+            "probability of a successful continuous run changes with duration."
+        ),
+    )
+    # Friendly day/week caption
+    if mission_hours_local >= 24:
+        if mission_hours_local < 24 * 14:
+            _cap = f"= {mission_hours_local / 24:.1f} days"
+        elif mission_hours_local < 24 * 90:
+            _cap = f"= {mission_hours_local / (24 * 7):.1f} weeks"
+        elif mission_hours_local < 24 * 365:
+            _cap = f"= {mission_hours_local / (24 * 30.44):.1f} months"
+        else:
+            _cap = f"= {mission_hours_local / 8760:.2f} years"
+        c_inp.caption(_cap)
+
+    with c_help:
+        st.markdown(
+            "**How to read this tab:**  All probabilities below assume the fleet "
+            "must run continuously for the duration entered to the left.  As "
+            "duration grows, the exp(−λ × t) term shrinks and the probability of "
+            "a successful run drops accordingly.  Use this to answer scenario "
+            "questions like 'can we ride through a 72-hour storm?' or 'what's "
+            "the probability of running 8,760 hours (full year) without failure?'"
+        )
 
     m = result.fleet_mission
     groups = m.groups

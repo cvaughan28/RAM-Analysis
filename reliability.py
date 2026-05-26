@@ -262,6 +262,43 @@ def mixed_fleet_kofn_availability(
     return float(np.sum(pmf[k:]))
 
 
+def mixed_fleet_mission_prob_integrated(
+    groups: List[tuple],   # List of (count, fts, ftlr, lambda_run)
+    k: int,
+    grid_mttr_hours: float,
+) -> float:
+    """
+    Mixed-fleet mission success probability INTEGRATED over an exponentially-
+    distributed grid outage duration with mean = grid_mttr_hours.
+
+    For exponential T ~ Exp(1/MTTR), the expected per-gen run-success factor is:
+        E[ exp(-lambda * T) ] = 1 / (1 + lambda * MTTR)
+
+    The per-demand start/load factors (1 - FTS) and (1 - FTLR) are unchanged
+    (they fire once per outage event regardless of how long the outage lasts).
+
+    This is the "Option A" analytical alternative to using a single fixed
+    mission duration -- it eliminates the arbitrary mission_duration_hours
+    input by integrating over the actual outage-duration distribution.
+
+    Parameters
+    ----------
+    groups          : list of (count, fts, ftlr, lambda_run_per_hour) per group
+    k               : minimum gens required for the system to succeed
+    grid_mttr_hours : mean grid outage duration (= grid MTTR)
+
+    Returns
+    -------
+    Probability that at least k gens complete their mission, averaged over
+    the distribution of grid outage durations.
+    """
+    mission_groups = [
+        (count, (1.0 - fts) * (1.0 - ftlr) / (1.0 + lam * grid_mttr_hours))
+        for count, fts, ftlr, lam in groups
+    ]
+    return mixed_fleet_kofn_availability(mission_groups, k)
+
+
 def mixed_fleet_mission_prob(
     groups: List[tuple],   # List of (count: int, fts: float, ftlr: float, lambda_run: float)
     k: int,

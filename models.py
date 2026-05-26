@@ -38,6 +38,7 @@ from reliability import (
     kofn_availability,
     mixed_fleet_kofn_availability,
     mixed_fleet_mission_prob,
+    mixed_fleet_mission_prob_integrated,
     ccf_unavailability,
     kofn_with_ccf,
     mission_reliability,
@@ -349,7 +350,16 @@ def calculate_system(
     if config.power_source_mode == "grid_with_backup":
         grid_avail = component_availability(config.grid_mtbf_hours, config.grid_mttr_hours)
         u_grid = 1.0 - grid_avail
-        source_avail = grid_avail + u_grid * system_mission
+        # Option A: integrate the per-gen mission success over an exponentially-
+        # distributed grid outage duration with mean = grid_MTTR.  This is the
+        # analytically defensible substitute for picking a single mission duration:
+        # the average outage time is grid_MTTR, and the formula matches what you'd
+        # get by averaging P_mission(t) over the outage distribution.
+        # See reliability.mixed_fleet_mission_prob_integrated().
+        mission_prob_integrated = mixed_fleet_mission_prob_integrated(
+            mission_groups_params, k_req, config.grid_mttr_hours
+        )
+        source_avail = grid_avail + u_grid * mission_prob_integrated
         source_desc = (
             f"Grid (MTBF={config.grid_mtbf_hours:,.0f} h, "
             f"MTTR={config.grid_mttr_hours:.2f} h) "
@@ -371,11 +381,15 @@ def calculate_system(
             "inputs": {
                 "A_grid": f"{grid_avail:.8f}",
                 "U_grid": f"{u_grid:.4e}",
-                "P_backup_mission": f"{system_mission:.8f}",
-                "Assumed outage duration": f"{t:.0f} h",
+                "P_backup_mission (integrated over grid MTTR)":
+                    f"{mission_prob_integrated:.8f}",
+                "Grid MTTR (= mean outage duration)":
+                    f"{config.grid_mttr_hours:.2f} h",
             },
             "result": source_avail,
-            "formula": "A_source = A_grid + U_grid * P_mission",
+            "formula": ("A_source = A_grid + U_grid * E_T[P_mission(T)], "
+                        "T ~ Exp(1/MTTR_grid). "
+                        "Per-gen run factor: 1/(1 + lambda * MTTR_grid)."),
         })
     else:
         source_avail = gen_fleet_a
